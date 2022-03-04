@@ -29,6 +29,14 @@ import {
 } from './reducers/tournament_reducer';
 import { MetaEventState, MetaStates } from './meta_game_events';
 import { StandardEnglishAlphabet } from '../constants/alphabets';
+import {
+  LiwordsSocket,
+  LiwordsSocketContext,
+  LiwordsSocketValues,
+  OnSocketMsgType,
+  useLiwordsSocketContext,
+} from '../socket/socket';
+import { useOnSocketMsg } from './socket_handlers';
 import { SeekRequest } from '../gen/api/proto/ipc/omgseeks_pb';
 import { ServerChallengeResultEvent } from '../gen/api/proto/ipc/omgwords_pb';
 
@@ -243,7 +251,6 @@ const LoginStateContext = createContext<LoginStateStoreData>({
     loggedIn: false,
     connectedToSocket: false,
     connID: '',
-    path: '',
     perms: [],
   },
   dispatchLoginState: defaultFunction,
@@ -759,9 +766,87 @@ const ExaminableStore = ({ children }: { children: React.ReactNode }) => {
   return <React.Fragment children={ret} />;
 };
 
-// The Real Store.
+// The Real LoginState Store.
 
-const RealStore = ({ children, ...props }: Props) => {
+const RealLoginStateStore = ({ children, ...props }: Props) => {
+  const { useState } = useMountedState();
+
+  const [loginState, setLoginState] = useState({
+    username: '',
+    userID: '',
+    loggedIn: false,
+    connectedToSocket: false,
+    connID: '',
+    perms: new Array<string>(),
+  });
+  const dispatchLoginState = useCallback(
+    (action) => setLoginState((state) => LoginStateReducer(state, action)),
+    []
+  );
+
+  const loginStateStore = useMemo(
+    () => ({
+      loginState,
+      dispatchLoginState,
+    }),
+    [loginState, dispatchLoginState]
+  );
+
+  return (
+    <LoginStateContext.Provider value={loginStateStore} children={children} />
+  );
+};
+
+// The Real LiwordsSocket Store.
+
+const RealLiwordsSocketStore = ({
+  resetLiwordsSocketStore,
+  children,
+  ...props
+}: Props & {
+  resetLiwordsSocketStore: () => void;
+}) => {
+  const { useState } = useMountedState();
+
+  const [onSocketMsg, setOnSocketMsg] = useState<OnSocketMsgType>(
+    () => defaultFunction
+  );
+
+  const [liwordsSocketValues, setLiwordsSocketValues] = useState<
+    LiwordsSocketValues
+  >({
+    sendMessage: defaultFunction,
+    justDisconnected: false,
+  });
+
+  const liwordsSocketStore = useMemo(
+    () => ({
+      liwordsSocketValues,
+      onSocketMsg,
+      resetLiwordsSocketStore,
+      setLiwordsSocketValues,
+      setOnSocketMsg,
+    }),
+    [
+      liwordsSocketValues,
+      onSocketMsg,
+      resetLiwordsSocketStore,
+      setLiwordsSocketValues,
+      setOnSocketMsg,
+    ]
+  );
+
+  return (
+    <LiwordsSocketContext.Provider
+      value={liwordsSocketStore}
+      children={children}
+    />
+  );
+};
+
+// The Real Rest Of Store.
+
+const RealRestOfStore = ({ children, ...props }: Props) => {
   const { useState } = useMountedState();
 
   const clockController = useRef<ClockController | null>(null);
@@ -786,19 +871,6 @@ const RealStore = ({ children, ...props }: Props) => {
   });
   const dispatchLobbyContext = useCallback(
     (action) => setLobbyContext((state) => LobbyReducer(state, action)),
-    []
-  );
-  const [loginState, setLoginState] = useState({
-    username: '',
-    userID: '',
-    loggedIn: false,
-    connectedToSocket: false,
-    connID: '',
-    path: '',
-    perms: new Array<string>(),
-  });
-  const dispatchLoginState = useCallback(
-    (action) => setLoginState((state) => LoginStateReducer(state, action)),
     []
   );
 
@@ -978,13 +1050,6 @@ const RealStore = ({ children, ...props }: Props) => {
     }),
     [lobbyContext, dispatchLobbyContext]
   );
-  const loginStateStore = useMemo(
-    () => ({
-      loginState,
-      dispatchLoginState,
-    }),
-    [loginState, dispatchLoginState]
-  );
   const tournamentStateStore = useMemo(
     () => ({
       tournamentContext,
@@ -1156,7 +1221,6 @@ const RealStore = ({ children, ...props }: Props) => {
     <ContextMatchContext.Provider value={contextMatchStore} children={ret} />
   );
   ret = <LobbyContext.Provider value={lobbyStore} children={ret} />;
-  ret = <LoginStateContext.Provider value={loginStateStore} children={ret} />;
   ret = <LagContext.Provider value={lagStore} children={ret} />;
   ret = (
     <TournamentContext.Provider value={tournamentStateStore} children={ret} />
@@ -1206,30 +1270,87 @@ const RealStore = ({ children, ...props }: Props) => {
   return <React.Fragment children={ret} />;
 };
 
-const ResetStoreContext = createContext({ resetStore: defaultFunction });
+// This needs to be nested inside the Rest Of Store.
+
+const InstallOnSocketMsg = ({ children }: { children: React.ReactNode }) => {
+  const { onSocketMsg, setOnSocketMsg } = useLiwordsSocketContext();
+
+  const newOnSocketMsg = useOnSocketMsg();
+
+  const oldOnSocketMsgRef = useRef(onSocketMsg);
+  oldOnSocketMsgRef.current = onSocketMsg;
+
+  React.useEffect(() => {
+    const old = oldOnSocketMsgRef.current;
+    setOnSocketMsg(() => newOnSocketMsg);
+    return () => {
+      setOnSocketMsg(() => old);
+    };
+  }, [newOnSocketMsg, setOnSocketMsg]);
+
+  return <React.Fragment children={children} />;
+};
+
+const ResetStoreContext = createContext({
+  resetLoginStateStore: defaultFunction,
+  resetRestOfStore: defaultFunction,
+});
 export const useResetStoreContext = () => useContext(ResetStoreContext);
+
+// Now includes the Socket.
 
 export const Store = ({ children }: { children: React.ReactNode }) => {
   const { useState } = useMountedState();
 
   // In JS the | 0 loops within int32 and avoids reaching Number.MAX_SAFE_INTEGER.
-  const [storeId, setStoreId] = useState(0);
-  const resetStore = useCallback(() => setStoreId((n) => (n + 1) | 0), []);
+  const [loginStateStoreId, setLoginStateStoreId] = useState(0);
+  const resetLoginStateStore = useCallback(
+    () => setLoginStateStoreId((n) => (n + 1) | 0),
+    []
+  );
+  const [liwordsSocketStoreId, setLiwordsSocketStoreId] = useState(0);
+  const resetLiwordsSocketStore = useCallback(
+    () => setLiwordsSocketStoreId((n) => (n + 1) | 0),
+    []
+  );
+  const [restOfStoreId, setRestOfStoreId] = useState(0);
+  const resetRestOfStore = useCallback(
+    () => setRestOfStoreId((n) => (n + 1) | 0),
+    []
+  );
 
   // Reset on browser navigation.
   React.useEffect(() => {
     const handleBrowserNavigation = (evt: PopStateEvent) => {
-      resetStore();
+      resetRestOfStore();
     };
     window.addEventListener('popstate', handleBrowserNavigation);
     return () => {
       window.removeEventListener('popstate', handleBrowserNavigation);
     };
-  }, [resetStore]);
+  }, [resetRestOfStore]);
+
+  const resetStore = useMemo(
+    () => ({
+      resetLoginStateStore,
+      resetRestOfStore,
+    }),
+    [resetLoginStateStore, resetRestOfStore]
+  );
 
   return (
-    <ResetStoreContext.Provider value={{ resetStore }}>
-      <RealStore key={storeId} children={children} />
+    <ResetStoreContext.Provider value={resetStore}>
+      <RealLoginStateStore key={loginStateStoreId}>
+        <RealLiwordsSocketStore
+          key={liwordsSocketStoreId}
+          resetLiwordsSocketStore={resetLiwordsSocketStore}
+        >
+          <LiwordsSocket />
+          <RealRestOfStore key={restOfStoreId}>
+            <InstallOnSocketMsg>{children}</InstallOnSocketMsg>
+          </RealRestOfStore>
+        </RealLiwordsSocketStore>
+      </RealLoginStateStore>
     </ResetStoreContext.Provider>
   );
 };
