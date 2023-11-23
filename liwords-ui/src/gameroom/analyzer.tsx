@@ -14,7 +14,7 @@ import {
   useGameContextStoreContext,
   useTentativeTileContext,
 } from '../store/store';
-import { getWolges } from '../wasm/loader';
+import { getWolges, getMagpie, MagpieMoveTypes } from '../wasm/loader';
 import { useMountedState } from '../utils/mounted';
 import { RedoOutlined } from '@ant-design/icons';
 import {
@@ -37,6 +37,9 @@ import {
   machineWordToRunes,
   runesToMachineWord,
 } from '../constants/alphabets';
+import { parseCoordinates, toFen } from '../utils/cwgame/board';
+import { computeLeaveML } from '../utils/cwgame/game_event';
+import { subscribe } from '../shared/pubsub';
 
 type AnalyzerProps = {
   includeCard?: boolean;
@@ -66,6 +69,7 @@ type JsonMove =
     };
 
 const jsonMoveToKey = (v: JsonMove) => {
+  // select just a few keys.
   switch (v.action) {
     case 'exchange': {
       return JSON.stringify(
@@ -95,10 +99,10 @@ const jsonMoveToKey = (v: JsonMove) => {
   }
 };
 
-export type AnalyzerMove = {
+type AnalyzerMove = {
   jsonKey: string;
   chosen?: boolean; // true for played, undefined for analyzer-generated moves
-  valid?: boolean; // undefined for analyzer-generated moves
+  valid?: boolean;
   invalid_words?: Array<string>;
   displayMove: string;
   coordinates: string;
@@ -111,6 +115,7 @@ export type AnalyzerMove = {
   vertical: boolean;
   tiles: MachineWord;
   isExchange: boolean;
+  winpct?: number;
 };
 
 const wolgesLetterToLiwordsLetter = (i: number) => {
@@ -140,7 +145,7 @@ const wolgesLetterToLabel = (i: number, alphabet: Alphabet) => {
   return machineLetterToRune(i, alphabet, false, true);
 };
 
-export const analyzerMoveFromJsonMove = (
+const analyzerMoveFromJsonMove = (
   move: JsonMove,
   dim: number,
   letters: Array<MachineLetter>,
@@ -274,18 +279,181 @@ export const analyzerMoveFromJsonMove = (
   }
 };
 
+const analyzerMoveFromUCGIString = (
+  ucgis: string,
+  dim: number,
+  letters: Array<MachineLetter>,
+  rackNum: MachineWord,
+  alphabet: Alphabet
+): AnalyzerMove => {
+  /**
+   * info currmove c9.ZEK sc 26 wp 70.503 wpe 4.870 eq -18.027 eqe 4.801 it 519 ig 1 ply1-scm 30.073 ply1-scd 23.176 ply1-bp 18.919 ply2-scm 19.492 ply2-scd 4.216 ply2-bp 0.000 ply3-scm 33.730 ply3-scd 23.773 ply3-bp 20.231 ply4-scm 24.286 ply4-scd 14.759 ply4-bp 6.509 ply5-scm 20.287 ply5-scd 17.196 ply5-bp 5.689
+   * currmove 6g.DIPETAZ result scored valid false invalid_words WIFAY,ZGENUINE,DIPETAZ sc 57 eq 72.947
+   */
+  if (ucgis.startsWith('info ')) {
+    ucgis = ucgis.substring(5);
+  }
+  const splitstr = ucgis.trim().split(' ');
+
+  const kv: { [x: string]: string } = {};
+  for (let i = 0; i < splitstr.length; i += 2) {
+    kv[splitstr[i]] = splitstr[i + 1];
+  }
+
+  const jsonKey = JSON.stringify({ move: kv['currmove'] });
+
+  const defaultRet = {
+    jsonKey,
+    displayMove: '',
+    coordinates: '',
+    // always leave out leave
+    vertical: false,
+    col: 0,
+    row: 0,
+    score: 0,
+    equity: 0.0,
+    winpct: 0.0,
+    tiles: new Array<MachineLetter>(),
+    isExchange: false,
+  };
+
+  if (kv['currmove'] === 'pass') {
+    return {
+      ...defaultRet,
+      leave: rackNum,
+      leaveWithGaps: rackNum,
+      equity: parseFloat(kv['eq']),
+      winpct: 'wp' in kv ? parseFloat(kv['wp']) : undefined,
+    };
+  }
+  if (kv['currmove'].startsWith('ex.')) {
+    let leaveNum = [...rackNum];
+    const leaveWithGaps = [...rackNum];
+
+    let tilesBeingMoved = new Array<MachineLetter>();
+
+    const parts = kv['currmove'].split('.');
+    // convert to machine letters.. only to convert back to runes. It's ok.
+    const word = runesToMachineWord(parts[1], alphabet);
+
+    for (const t of word) {
+      tilesBeingMoved.push(t);
+      const usedTileIndex = leaveNum.lastIndexOf(t);
+      if (usedTileIndex >= 0) {
+        leaveWithGaps[usedTileIndex] = EmptyRackSpaceMachineLetter;
+        leaveNum[usedTileIndex] = EmptyRackSpaceMachineLetter;
+      }
+    }
+    tilesBeingMoved = sortTiles(tilesBeingMoved, alphabet);
+    leaveNum = sortTiles(leaveNum, alphabet);
+
+    return {
+      ...defaultRet,
+      displayMove:
+        tilesBeingMoved.length > 0
+          ? `Exch. ${machineWordToRunes(
+              tilesBeingMoved,
+              alphabet,
+              false,
+              true
+            )}`
+          : 'Pass',
+      leave: leaveNum,
+      leaveWithGaps,
+      equity: parseFloat(kv['eq']),
+      winpct: 'wp' in kv ? parseFloat(kv['wp']) : undefined,
+      tiles: tilesBeingMoved,
+      isExchange: true,
+    };
+  } else {
+    // it's a tile move play
+    let leaveNum = [...rackNum];
+    const leaveWithGaps = [...rackNum];
+    let displayMove = '';
+    const tilesBeingMoved = new Array<MachineLetter>();
+
+    const parts = kv['currmove'].split('.');
+    // coordinates will be valid, since UCGI will not send invalid coordinates.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const coords = parseCoordinates(parts[0])!;
+    const vertical = !coords.horizontal;
+    const row = coords.row;
+    const col = coords.col;
+
+    const rowStr = String(row + 1);
+    const colStr = String.fromCharCode(col + 0x41);
+    const coordinates = vertical ? `${colStr}${rowStr}` : `${rowStr}${colStr}`;
+
+    // convert to machine letters.. only to convert back to runes. It's ok.
+    const word = runesToMachineWord(parts[1], alphabet);
+
+    // copy some of this from analyzerMoveFromJsonMove
+    let r = row;
+    let c = col;
+    let inParen = false;
+    for (const t of word) {
+      if (letters[r * dim + c] !== 0) {
+        // There is already a tile in the board at this position.
+        if (!inParen) {
+          displayMove += '(';
+          inParen = true;
+        }
+        displayMove += machineLetterToRune(
+          letters[r * dim + c],
+          alphabet,
+          false,
+          true
+        );
+        tilesBeingMoved.push(0); // through space
+      } else {
+        if (inParen) {
+          displayMove += ')';
+          inParen = false;
+        }
+        const tileLabel = machineLetterToRune(t, alphabet, false, true);
+        displayMove += tileLabel;
+        tilesBeingMoved.push(t);
+        // When t is negative, consume blank tile from rack.
+        const usedTileIndex = leaveNum.lastIndexOf(Math.max(t, 0));
+        if (usedTileIndex >= 0) {
+          leaveWithGaps[usedTileIndex] = EmptyRackSpaceMachineLetter;
+          leaveNum[usedTileIndex] = EmptyRackSpaceMachineLetter;
+        }
+      }
+      if (vertical) ++r;
+      else ++c;
+    }
+    if (inParen) displayMove += ')';
+
+    // sortTiles takes out the gaps:
+    leaveNum = sortTiles(leaveNum, alphabet);
+    return {
+      jsonKey,
+      displayMove,
+      coordinates,
+      leave: leaveNum,
+      leaveWithGaps,
+      vertical,
+      col,
+      row,
+      score: parseInt(kv['sc'], 10),
+      equity: parseFloat(kv['eq']),
+      winpct: 'wp' in kv ? parseFloat(kv['wp']) : undefined,
+      tiles: tilesBeingMoved,
+      isExchange: false,
+      valid: kv['valid'] === 'true' || kv['valid'] == undefined,
+      invalid_words: kv['invalid_words']?.split(',') ?? undefined,
+    };
+  }
+};
+
 const parseExaminableGameContext = (
   examinableGameContext: GameState,
   lexicon: string,
   variant?: string
 ) => {
-  const {
-    board: { dim, letters },
-    onturn,
-    players,
-    alphabet,
-  } = examinableGameContext;
-
+  const { board, onturn, players, alphabet } = examinableGameContext;
+  const { dim, letters } = board;
   const letterDistribution = defaultLetterDistribution(lexicon);
   // const labelToNum = labelToNumFor(letterDistribution);
   // const numToLabel = numToLabelFor(letterDistribution);
@@ -330,26 +498,43 @@ const parseExaminableGameContext = (
     rules,
   };
 
-  return { dim, letters, rackNum, effectiveLexicon, boardObj, alphabet };
+  const fen = toFen(board, alphabet);
+  const ourRack = machineWordToRunes(rackNum, alphabet);
+  const ourScore = players[onturn].score;
+  const theirScore = players[1 - onturn].score;
+  const cgp = `${fen} ${ourRack}/ ${ourScore}/${theirScore} 0 lex ${lexicon}; ld ${letterDistribution};`;
+
+  return { dim, letters, rackNum, effectiveLexicon, boardObj, alphabet, cgp };
 };
 
 const AnalyzerContext = React.createContext<{
   autoMode: boolean;
   setAutoMode: React.Dispatch<React.SetStateAction<boolean>>;
+  staticOnlyMode: boolean;
+  setStaticOnlyMode: React.Dispatch<React.SetStateAction<boolean>>;
   cachedMoves: Array<AnalyzerMove> | null;
   examinerLoading: boolean;
   requestAnalysis: (lexicon: string, variant?: string) => void;
   showMovesForTurn: number;
   setShowMovesForTurn: (a: number) => void;
+  nps: number;
 }>({
   autoMode: false,
+  staticOnlyMode: false,
   cachedMoves: null,
   examinerLoading: false,
   requestAnalysis: (lexicon: string, variant?: string) => {},
   showMovesForTurn: -1,
   setShowMovesForTurn: (a: number) => {},
   setAutoMode: () => {},
+  setStaticOnlyMode: () => {},
+  nps: 0,
 });
+
+type MovesCache = { [key: string]: Array<AnalyzerMove> | null };
+
+const cacheKey = (turn: number, staticOnlyMode: boolean) =>
+  `t${turn}-st${staticOnlyMode}`;
 
 export const AnalyzerContextProvider = ({
   children,
@@ -367,30 +552,47 @@ export const AnalyzerContextProvider = ({
   );
   const [showMovesForTurn, setShowMovesForTurn] = useState(-1);
   const [autoMode, setAutoMode] = useState(false);
+  const [staticOnlyMode, setStaticOnlyMode] = useState(false);
   const [unrace, setUnrace] = useState(new Unrace());
+  const [nps, setNps] = useState(0);
 
   const { gameContext: examinableGameContext } =
     useExaminableGameContextStoreContext();
 
   const examinerId = useRef(0);
-  const movesCacheRef = useRef<Array<Array<AnalyzerMove> | null>>([]);
+  const movesCacheRef = useRef<MovesCache>({});
+  const maxThreads = Math.max(navigator.hardwareConcurrency - 1, 1);
   useEffect(() => {
     examinerId.current = (examinerId.current + 1) | 0;
-    movesCacheRef.current = [];
+    movesCacheRef.current = {};
     setUnrace(new Unrace());
   }, [examinableGameContext.gameID]);
+
+  useEffect(() => {
+    // note this is not really used for anything other than logging
+    console.log('Subscribing to magpie.stdout');
+    const { unsubscribe } = subscribe('magpie.stdout', (d: string) => {
+      console.log('data', d);
+    });
+
+    return () => {
+      console.log('unsubscribing');
+      unsubscribe();
+    };
+  }, []);
 
   const requestAnalysis = useCallback(
     (lexicon, variant) => {
       const examinerIdAtStart = examinerId.current;
       const turn = examinableGameContext.turns.length;
       if (nocache) {
-        movesCacheRef.current = [];
+        movesCacheRef.current = {};
       }
       const movesCache = movesCacheRef.current;
+      const ck = cacheKey(turn, staticOnlyMode);
       // null = loading. undefined = not yet requested.
-      if (movesCache[turn] !== undefined) return;
-      movesCache[turn] = null;
+      if (movesCache[ck] !== undefined) return;
+      movesCache[ck] = null;
 
       unrace.run(async () => {
         try {
@@ -401,58 +603,139 @@ export const AnalyzerContextProvider = ({
             effectiveLexicon,
             boardObj: bareBoardObj,
             alphabet,
+            cgp,
           } = parseExaminableGameContext(
             examinableGameContext,
             lexicon,
             variant
           );
           const boardObj = { ...bareBoardObj, count: 15 };
-
-          const wolges = await getWolges(effectiveLexicon);
+          let wolges, magpie;
+          if (variant === 'wordsmog' || variant === 'classic_super') {
+            // magpie doesn't yet support these variants
+            wolges = await getWolges(effectiveLexicon);
+          } else {
+            magpie = await getMagpie(effectiveLexicon);
+          }
           if (examinerIdAtStart !== examinerId.current) return;
 
           const boardStr = JSON.stringify(boardObj);
-          const movesStr = await wolges.analyze(boardStr);
-          if (examinerIdAtStart !== examinerId.current) return;
-          const movesObj = JSON.parse(movesStr) as Array<JsonMove>;
+          if (wolges) {
+            const movesStr = await wolges.analyze(boardStr);
+            if (examinerIdAtStart !== examinerId.current) return;
 
-          const formattedMoves = movesObj.map((move) =>
-            analyzerMoveFromJsonMove(move, dim, letters, rackNum, alphabet)
-          );
-          movesCache[turn] = formattedMoves;
-          rerenderMoves();
+            const movesObj = JSON.parse(movesStr) as Array<JsonMove>;
+            const formattedMoves = movesObj.map((move) =>
+              analyzerMoveFromJsonMove(move, dim, letters, rackNum, alphabet)
+            );
+            movesCache[ck] = formattedMoves;
+            rerenderMoves();
+          } else if (magpie) {
+            let resp = '';
+            if (staticOnlyMode) {
+              resp = await magpie.staticEvaluation(cgp, 15);
+              const formattedMoves = resp
+                .split('\n')
+                .filter((move: string) => move && !move.startsWith('bestmove'))
+                .map((move: string) =>
+                  analyzerMoveFromUCGIString(
+                    move,
+                    dim,
+                    letters,
+                    rackNum,
+                    alphabet
+                  )
+                );
+              movesCache[ck] = formattedMoves;
+              rerenderMoves();
+            } else {
+              await magpie.processUCGICommand(`position cgp ${cgp}`);
+              await magpie.processUCGICommand(
+                `go sim threads ${maxThreads} plays 40 stopcondition 95 depth 5 i 5000 checkstop 500`
+              );
+              const interval = setInterval(async () => {
+                const status = (await magpie.searchStatus()) as string;
+                const lines = status.split('\n');
+                const moves = [];
+                for (let i = 0; i < lines.length; i++) {
+                  if (lines[i].startsWith('info nps')) {
+                    setNps(parseFloat(lines[i].substring(9)));
+                  } else if (
+                    lines[i].startsWith('bestmove') ||
+                    lines[i].startsWith('bestsofar')
+                  ) {
+                    continue;
+                  } else if (lines[i].trim() !== '') {
+                    moves.push(
+                      analyzerMoveFromUCGIString(
+                        lines[i],
+                        dim,
+                        letters,
+                        rackNum,
+                        alphabet
+                      )
+                    );
+                  }
+                }
+                movesCache[ck] = moves;
+                rerenderMoves();
+                if (status.includes('bestmove')) {
+                  console.log('stop interval');
+                  clearInterval(interval);
+                }
+              }, 500);
+            }
+            // setTimeout(() => {
+            //   console.log('gonna get search status');
+            //   const status = analyzerBinary.searchStatus();
+            //   console.log('status', status);
+            // }, 100);
+          }
         } catch (e) {
           if (examinerIdAtStart === examinerId.current) {
-            movesCache[turn] = [];
+            movesCache[ck] = [];
             rerenderMoves();
           }
           throw e;
         }
       });
     },
-    [examinableGameContext, nocache, rerenderMoves, unrace]
+    [
+      examinableGameContext,
+      nocache,
+      rerenderMoves,
+      staticOnlyMode,
+      unrace,
+      maxThreads,
+    ]
   );
-
-  const cachedMoves = movesCacheRef.current[examinableGameContext.turns.length];
+  const cck = cacheKey(examinableGameContext.turns.length, staticOnlyMode);
+  const cachedMoves = movesCacheRef.current[cck];
   const examinerLoading = cachedMoves === null;
   const contextValue = useMemo(
     () => ({
       autoMode,
       setAutoMode,
+      staticOnlyMode,
+      setStaticOnlyMode,
       cachedMoves,
       examinerLoading,
       requestAnalysis,
       showMovesForTurn,
       setShowMovesForTurn,
+      nps,
     }),
     [
       autoMode,
       setAutoMode,
+      staticOnlyMode,
+      setStaticOnlyMode,
       cachedMoves,
       examinerLoading,
       requestAnalysis,
       showMovesForTurn,
       setShowMovesForTurn,
+      nps,
     ]
   );
 
@@ -526,11 +809,14 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
   const {
     autoMode,
     setAutoMode,
+    staticOnlyMode,
+    setStaticOnlyMode,
     cachedMoves,
     examinerLoading,
     requestAnalysis,
     showMovesForTurn,
     setShowMovesForTurn,
+    nps,
   } = useContext(AnalyzerContext);
 
   const { gameContext: examinableGameContext } =
@@ -554,6 +840,10 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
   const toggleAutoMode = useCallback(() => {
     setAutoMode((autoMode) => !autoMode);
   }, [setAutoMode]);
+  const toggleStaticOnlyMode = useCallback(() => {
+    setStaticOnlyMode((staticOnlyMode) => !staticOnlyMode);
+  }, [setStaticOnlyMode]);
+
   // Let ExaminableStore activate this.
   useEffect(() => {
     addHandleExaminer(handleExaminer);
@@ -639,6 +929,7 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
     moveObj: null,
     analyzerMove: null,
   });
+
   useEffect(() => {
     evaluatedMoveId.current = (evaluatedMoveId.current + 1) | 0;
     const evaluatedMoveIdAtStart = evaluatedMoveId.current;
@@ -651,44 +942,99 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
           effectiveLexicon,
           boardObj: bareBoardObj,
           alphabet,
+          cgp,
         } = parseExaminableGameContext(examinableGameContext, lexicon, variant);
         const boardObj = { ...bareBoardObj, plays: [actualMove] };
+        let wolges, magpie;
 
-        const wolges = await getWolges(effectiveLexicon);
+        if (variant === 'wordsmog' || variant === 'classic_super') {
+          wolges = await getWolges(effectiveLexicon);
+        } else {
+          magpie = await getMagpie(effectiveLexicon);
+        }
+
         if (evaluatedMoveIdAtStart !== evaluatedMoveId.current) return;
 
-        const boardStr = JSON.stringify(boardObj);
-        const movesStr = await wolges.play_score(boardStr);
-        if (evaluatedMoveIdAtStart !== evaluatedMoveId.current) return;
-        const movesObj = JSON.parse(movesStr);
-        const moveObj = movesObj[0];
+        if (wolges) {
+          const boardStr = JSON.stringify(boardObj);
+          const movesStr = await wolges.play_score(boardStr);
+          if (evaluatedMoveIdAtStart !== evaluatedMoveId.current) return;
+          const movesObj = JSON.parse(movesStr);
+          const moveObj = movesObj[0];
 
-        if (moveObj.result === 'scored') {
-          const analyzerMove = analyzerMoveFromJsonMove(
-            moveObj,
+          if (moveObj.result === 'scored') {
+            const analyzerMove = analyzerMoveFromJsonMove(
+              moveObj,
+              dim,
+              letters,
+              rackNum,
+              alphabet
+            );
+            setEvaluatedMove({
+              evaluatedMoveId: evaluatedMoveIdAtStart,
+              moveObj: moveObj,
+              analyzerMove: {
+                ...analyzerMove,
+                chosen: true,
+                valid: moveObj.valid,
+                invalid_words: moveObj.invalid_words?.map(
+                  (tiles: Array<number>) => machineWordToRunes(tiles, alphabet)
+                ),
+              },
+            });
+          } else {
+            console.error('invalid move', moveObj);
+            setEvaluatedMove({
+              evaluatedMoveId: evaluatedMoveIdAtStart,
+              moveObj: null,
+              analyzerMove: null,
+            });
+          }
+        } else if (magpie) {
+          let moveType = MagpieMoveTypes.Play;
+          let playedTiles = actualMove.word;
+          if (actualMove.action === 'exchange') {
+            if (actualMove.tiles?.length === 0) {
+              playedTiles = [];
+              moveType = MagpieMoveTypes.Pass;
+            } else {
+              playedTiles = actualMove.tiles;
+              moveType = MagpieMoveTypes.Exchange;
+            }
+          }
+          playedTiles = playedTiles?.map(wolgesLetterToLiwordsLetter) || [];
+
+          const moveStr = await magpie.scorePlay(
+            cgp,
+            moveType,
+            actualMove.down ? actualMove.idx : actualMove.lane,
+            actualMove.down ? actualMove.lane : actualMove.idx,
+            actualMove.down,
+            playedTiles,
+            computeLeaveML(playedTiles, rackNum)
+          );
+          console.log('scoreplay', cgp, 'ret', moveStr);
+          const analyzerMove = analyzerMoveFromUCGIString(
+            moveStr,
             dim,
             letters,
             rackNum,
             alphabet
           );
+          const moveObj = {
+            equity: analyzerMove.equity,
+            action: analyzerMove.isExchange ? 'exchange' : 'play',
+            valid: analyzerMove.valid,
+            // doesn't matter what we put for tiles here, we're not using this value:
+            tiles: new Array<number>(),
+          };
           setEvaluatedMove({
             evaluatedMoveId: evaluatedMoveIdAtStart,
-            moveObj: moveObj,
+            moveObj: moveObj as JsonMove,
             analyzerMove: {
               ...analyzerMove,
               chosen: true,
-              valid: moveObj.valid,
-              invalid_words: moveObj.invalid_words?.map(
-                (tiles: Array<number>) => machineWordToRunes(tiles, alphabet)
-              ),
             },
-          });
-        } else {
-          console.error('invalid move', moveObj);
-          setEvaluatedMove({
-            evaluatedMoveId: evaluatedMoveIdAtStart,
-            moveObj: null,
-            analyzerMove: null,
           });
         }
       })();
@@ -706,16 +1052,26 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
     if (currentEvaluatedMove) {
       let found = false;
       const arr = [];
+      console.log(
+        'curMove',
+        currentEvaluatedMove,
+        'cachedMoves',
+        JSON.stringify(cachedMoves)
+      );
       for (const elt of cachedMoves) {
         if (!found) {
+          console.log('trying to add', JSON.stringify(elt));
           if (currentEvaluatedMove.analyzerMove) {
+            console.log('anmove', currentEvaluatedMove.analyzerMove);
             if (elt.jsonKey === currentEvaluatedMove.analyzerMove.jsonKey) {
-              arr.push(currentEvaluatedMove.analyzerMove);
+              const combined = { ...currentEvaluatedMove.analyzerMove, ...elt };
+              arr.push(combined);
               found = true;
               continue;
             }
           }
           if (currentEvaluatedMove.moveObj) {
+            console.log('mobj', currentEvaluatedMove.moveObj);
             if (elt.equity < currentEvaluatedMove.moveObj.equity) {
               // phonies may have better equity than valid plays
               if (currentEvaluatedMove.analyzerMove) {
@@ -776,8 +1132,9 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
           <td className="move-leave">
             {machineWordToRunes(m.leave, examinableGameContext.alphabet)}
           </td>
-          <td className="move-equity">
-            {(m.equity - equityBase).toFixed(2)}
+          <td className="move-equity">{(m.equity - equityBase).toFixed(2)}</td>
+          <td className="move-winpct">
+            {m.winpct !== undefined ? m.winpct.toFixed(2) + '%' : ''}
             {!(m.valid ?? true) && <React.Fragment>*</React.Fragment>}
           </td>
         </tr>
@@ -794,6 +1151,23 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
         onClick={handleExaminer}
         disabled={autoMode || examinerLoading}
       />
+
+      <div className="analyzer-details">
+        <Button className="analyzer-details-btn" type="link">
+          Details
+        </Button>
+      </div>
+
+      <div className="static-only">
+        <p className="static-only-label">Rapid</p>
+        <Switch
+          checked={staticOnlyMode}
+          onChange={toggleStaticOnlyMode}
+          className="static-only-toggle"
+          size="small"
+        />
+      </div>
+
       <div className="auto-controls">
         <p className="auto-label">Auto</p>
         <Switch
@@ -809,6 +1183,9 @@ export const Analyzer = React.memo((props: AnalyzerProps) => {
     <div className="analyzer-container">
       {!examinerLoading ? (
         <div className="suggestions" style={props.style}>
+          {nps !== 0 ? (
+            <div>{`${(nps / 1000).toFixed(2)}k nodes/sec`}</div>
+          ) : null}
           <table>
             <tbody>{renderAnalyzerMoves}</tbody>
           </table>
